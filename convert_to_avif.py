@@ -13,9 +13,9 @@ import subprocess
 import os
 import sys
 import time
+import platform
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-# --- CONSTANTS & CONFIGURATION ---
 DEFAULT_SIZE_THRESHOLD_MB = 0.3
 DEFAULT_QUALITY = 70
 DEFAULT_AVIF_SPEED = 5
@@ -29,7 +29,6 @@ IMAGE_EXTENSIONS = {
 try:
     from tqdm import tqdm
 except ImportError:
-    # Lightweight shim to prevent crashes if tqdm is not installed
     class tqdm:
         def __init__(self, iterable, *args, **kwargs):
             self.iterable = iterable
@@ -40,6 +39,17 @@ except ImportError:
         @staticmethod
         def write(text):
             print(text)
+
+def get_install_hints():
+    """Returns OS-specific installation suggestions for required tools."""
+    os_type = platform.system()
+    if os_type == "Darwin":
+        return "Try: 'brew install libavif exiftool'"
+    elif os_type == "Linux":
+        return "Try: 'sudo apt install libavif-bin libimage-exiftool-perl' (Debian/Ubuntu)"
+    elif os_type == "Windows":
+        return "Please download avifenc and exiftool binaries from their official websites."
+    return "Please install libavif-bin and exiftool."
 
 def check_command(cmd):
     return shutil.which(cmd) is not None
@@ -61,7 +71,7 @@ def human_time(seconds):
 
 def encode_avif(src: Path, dst: Path, quality: int, speed: int, yuv: str, threads: int):
     if not check_command("avifenc"):
-        return False, "", "avifenc not found. Please install libavif-bin."
+        return False, "", "avifenc not found."
     cmd = [
         "avifenc", 
         "-j", str(threads), 
@@ -111,8 +121,12 @@ def find_images(root: Path, target_format: str):
         if p.suffix.lower() in IMAGE_EXTENSIONS:
             yield p
 
-def process_file(src: Path, quality: int, speed: int, yuv: str, threads: int, dry_run: bool, size_check_enabled: bool, size_threshold_mb: float):
+def process_file(src: Path, quality: int, speed: int, yuv: str, threads: int, dry_run: bool, size_check_enabled: bool, size_threshold_mb: float, skip_heic: bool):
     original_size = src.stat().st_size
+    
+    if skip_heic and src.suffix.lower() == ".heic":
+        return {"path": src, "status": "skipped_heic", "msg": "HEIC conversion disabled", "before": original_size, "after": original_size, "saved": 0}
+
     dst = src.with_suffix(".avif")
     
     if dst.exists() and dst.stat().st_mtime > src.stat().st_mtime and not dry_run:
@@ -139,13 +153,18 @@ def process_file(src: Path, quality: int, speed: int, yuv: str, threads: int, dr
                 except Exception: pass
             return {"path": src, "status": "skipped_size", "msg": "Below or equal to threshold", "before": original_size, "after": new_size, "saved": saved}
 
-        copy_metadata(src, tmpdst)
+        meta_ok, meta_msg = copy_metadata(src, tmpdst)
+        
         try:
             preserve_timestamp(src, tmpdst)
         except Exception:
             pass
 
         tmpdst.replace(dst)
+        
+        if not meta_ok:
+            return {"path": src, "status": "warning", "msg": f"Metadata failed: {meta_msg}", "before": original_size, "after": new_size, "saved": saved}
+            
         return {"path": src, "status": "done", "msg": "metadata preserved", "before": original_size, "after": new_size, "saved": saved}
 
     except Exception as e:
@@ -166,6 +185,7 @@ def main():
     parser.add_argument("--delete-originals", action="store_true", help="Delete originals")
     parser.add_argument("--size-check", action="store_true", help="Skip if size difference is below or equal to threshold")
     parser.add_argument("--size-threshold", type=float, default=DEFAULT_SIZE_THRESHOLD_MB, help="Minimum size difference in MB")
+    parser.add_argument("--skip-heic", action="store_true", help="Do not convert .heic files")
     
     args = parser.parse_args()
 
@@ -175,7 +195,8 @@ def main():
         sys.exit(2)
 
     if not check_command("avifenc"):
-        print("avifenc not found in PATH. Please install libavif-bin.", file=sys.stderr)
+        print("avifenc not found in PATH.", file=sys.stderr)
+        print(f"Installation Hint: {get_install_hints()}", file=sys.stderr)
         sys.exit(2)
 
     files = list(find_images(root, "avif"))
@@ -193,11 +214,12 @@ def main():
     print(f"Dry Run          : {args.dry_run}")
     print(f"Delete Originals : {args.delete_originals}")
     print(f"Size Check       : {args.size_check} (Threshold: {args.size_threshold} MB)")
+    print(f"Skip HEIC        : {args.skip_heic}")
     print("-----------------------\n")
 
     totals_before = 0
     totals_after = 0
-    results = {"done": 0, "skipped": 0, "skipped_size": 0, "error": 0, "dryrun": 0}
+    results = {"done": 0, "warning": 0, "skipped": 0, "skipped_size": 0, "skipped_heic": 0, "error": 0, "dryrun": 0}
     
     unsupported_list = []
     error_list = []
@@ -206,8 +228,10 @@ def main():
 
     tag_mapping = {
         "done": "Done",
+        "warning": "Warning",
         "skipped": "Skipped",
         "skipped_size": "Skipped (size-filter)",
+        "skipped_heic": "Skipped (HEIC)",
         "error": "Error",
         "dryrun": "Dry-run"
     }
@@ -218,7 +242,7 @@ def main():
         futures = [
             executor.submit(
                 process_file, p, args.quality, args.speed, args.yuv, 
-                args.threads, args.dry_run, args.size_check, args.size_threshold
+                args.threads, args.dry_run, args.size_check, args.size_threshold, args.skip_heic
             )
             for p in files
         ]
@@ -240,12 +264,11 @@ def main():
                 diff_mb = (before_size - after_size) / BYTES_IN_MB if after_size > 0 else 0.0
                 pct_change = ((before_size - after_size) / before_size * 100) if before_size > 0 and after_size > 0 else 0.0
 
-            disp_after = after_size if after_size > 0 else (before_size if status in ("skipped", "skipped_size") else 0)
+            disp_after = after_size if after_size > 0 else (before_size if status in ("skipped", "skipped_size", "skipped_heic") else 0)
             
-            # Use tqdm.write instead of print to keep the progress bar at the bottom
             tqdm.write(f"[{tag}] {res['path']} ({human_size(before_size)} → {human_size(disp_after)}) [Diff: {diff_mb:+.2f} MB ({pct_change:+.2f}%)] [{res['msg']}]")
 
-            if status == "done":
+            if status in ("done", "warning"):
                 totals_before += before_size
                 totals_after += after_size
                 if args.delete_originals and not args.dry_run:
@@ -254,7 +277,7 @@ def main():
                         tqdm.write(f"          -> Deleted original file.")
                     except Exception as e:
                         tqdm.write(f"          [WARN] Could not delete original: {e}")
-            elif status in ("skipped", "skipped_size"):
+            elif status in ("skipped", "skipped_size", "skipped_heic"):
                 totals_before += before_size
                 totals_after += before_size
             elif status == "error":
@@ -270,28 +293,5 @@ def main():
     print("="*50)
     print(f"Total Elapsed Time      : {human_time(total_elapsed_time)}")
     
-    total_files_encoded = results.get("done", 0) + results.get("skipped_size", 0)
-    if total_files_encoded > 0:
-        avg_processing_rate = total_elapsed_time / total_files_encoded
-        print(f"Files Successfully Done : {results.get('done', 0)}")
-        if args.size_check:
-            print(f"Skipped (Size Threshold): {results.get('skipped_size', 0)}")
-        print(f"Average Image Rate      : {avg_processing_rate:.2f} wall-clock seconds/image")
-
-    if error_list:
-        print(f"Processing Errors       : {len(error_list)}")
-        
-    if totals_before > 0:
-        print("-" * 50)
-        print(f"Total Space Processed   : {human_size(totals_before)}")
-        print(f"Total Space Saved       : {human_size(total_saved)} ({total_pct:.1f}% reduction)")
-        print("="*50)
-
-    if error_list:
-        print("\n=== Processing Errors Details ===")
-        for path, err_msg in error_list:
-            print(f"  - {path}: {err_msg}")
-
-if __name__ == "__main__":
-    main()
+    total_files_encoded = results.get("
 
