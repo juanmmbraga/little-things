@@ -29,7 +29,17 @@ IMAGE_EXTENSIONS = {
 try:
     from tqdm import tqdm
 except ImportError:
-    tqdm = lambda x, **kwargs: x
+    # Lightweight shim to prevent crashes if tqdm is not installed
+    class tqdm:
+        def __init__(self, iterable, *args, **kwargs):
+            self.iterable = iterable
+        def __iter__(self):
+            return iter(self.iterable)
+        def __len__(self):
+            return len(self.iterable)
+        @staticmethod
+        def write(text):
+            print(text)
 
 def check_command(cmd):
     return shutil.which(cmd) is not None
@@ -231,7 +241,9 @@ def main():
                 pct_change = ((before_size - after_size) / before_size * 100) if before_size > 0 and after_size > 0 else 0.0
 
             disp_after = after_size if after_size > 0 else (before_size if status in ("skipped", "skipped_size") else 0)
-            print(f"[{tag}] {res['path']} ({human_size(before_size)} → {human_size(disp_after)}) [Diff: {diff_mb:+.2f} MB ({pct_change:+.2f}%)] [{res['msg']}]")
+            
+            # Use tqdm.write instead of print to keep the progress bar at the bottom
+            tqdm.write(f"[{tag}] {res['path']} ({human_size(before_size)} → {human_size(disp_after)}) [Diff: {diff_mb:+.2f} MB ({pct_change:+.2f}%)] [{res['msg']}]")
 
             if status == "done":
                 totals_before += before_size
@@ -239,9 +251,9 @@ def main():
                 if args.delete_originals and not args.dry_run:
                     try:
                         res["path"].unlink()
-                        print(f"          -> Deleted original file.")
+                        tqdm.write(f"          -> Deleted original file.")
                     except Exception as e:
-                        print(f"          [WARN] Could not delete original: {e}")
+                        tqdm.write(f"          [WARN] Could not delete original: {e}")
             elif status in ("skipped", "skipped_size"):
                 totals_before += before_size
                 totals_after += before_size
@@ -282,3 +294,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
