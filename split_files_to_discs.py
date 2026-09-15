@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-"""
-This tool splits a large folder into smaller "Disc" folders based on a size limit (default 4.6GB for DVDs). 
-It preserves your folder structure and generates SHA256 checksums for each disc to verify that no data is corrupted after burning.
-
-Usage: python script.py <source_folder> <output_folder> [--capacity bytes] [--plan-only]
-"""
 from pathlib import Path
 from collections import defaultdict
 import argparse
@@ -13,24 +7,20 @@ import os
 import shutil
 import sys
 
-
+# Target ~4.6 GB (safe boundary slightly under standard 4.7 GB DVD-R capacity)
 DEFAULT_CAPACITY = 4_600_000_000
 DVD_SECTOR_SIZE = 2048
-
 INTEGRITY_FOLDER_NAME = "Check data integrity on disk"
 CHECKSUM_FILENAME = "checksums.sha"
 INSTRUCTIONS_FILENAME = "Verification instructions.txt"
-
 INSTRUCTIONS_TEXT = """Verification Instructions
 
 This disc contains a file named checksums.sha. This file is used to ensure that your data has not been corrupted over time or damaged during the burning process.
 
 How to verify your files on Linux:
-
 1. Open a terminal.
 2. Navigate to the folder containing the checksums.sha file.
 3. Enter the following command:
-
    sha256sum -c checksums.sha --quiet
 
 What to expect:
@@ -42,102 +32,142 @@ Please note:
 - To keep the verification working, do not rename or move the files on the disc.
 
 To create a new checksum file for a folder, use:
-
 find . -type f ! -name 'checksums.sha' -print0 | sort -z | xargs -0 sha256sum > checksums.sha
 """
 
-
 def sha256_file(file_path, chunk_size=1024 * 1024):
-    """Calculate SHA256 checksum of a file."""
+    """Compute the SHA-256 hash of a file reading in chunks to prevent memory bloat."""
     digest = hashlib.sha256()
-
     with file_path.open("rb") as file:
         while True:
             chunk = file.read(chunk_size)
-
             if not chunk:
                 break
-
             digest.update(chunk)
-
     return digest.hexdigest()
 
-
-def alphabetical_key(path):
+def sort_key_case_insensitive(path):
+    """Provide a consistent, case-insensitive sort key across different operating systems."""
     return str(path).casefold()
 
+def bytes_to_gb(bytes_value):
+    """Convert raw byte counts into human-readable gigabytes."""
+    return bytes_value / (1024 ** 3)
+
+class ProgressTracker:
+    """Track and render a clean, 3-line live dashboard updated in place."""
+
+    def __init__(self, disc_number, capacity, total_files, cumulative_start=0):
+        self.disc_number = disc_number
+        self.capacity = capacity
+        self.total_files = total_files
+        self.cumulative_file_index = cumulative_start
+        self.disc_bytes_written = 0
+        self.current_folder = None
+        self.has_drawn = False
+
+    def update(self, file_size, folder_name, filename):
+        """Redraw the 3-line block in place without spilling or wrapping."""
+        self.cumulative_file_index += 1
+        self.disc_bytes_written += file_size
+        self.current_folder = folder_name
+
+        term_width = shutil.get_terminal_size(fallback=(80, 24)).columns
+
+        # Calculate metrics
+        used_gb = bytes_to_gb(self.disc_bytes_written)
+        total_gb = bytes_to_gb(self.capacity)
+        disc_pct = (self.disc_bytes_written / self.capacity * 100) if self.capacity else 0
+        overall_pct = (self.cumulative_file_index / self.total_files * 100) if self.total_files else 100
+
+        # Build each of the 3 lines
+        line1 = f"Disc {self.disc_number:02d} ({used_gb:.2f} GB / {total_gb:.1f} GB — {disc_pct:5.1f}%)"
+        line2 = f"  Folder: {self.current_folder}/"
+        line3 = f"    [{self.cumulative_file_index:5d}/{self.total_files}]  {overall_pct:5.1f}% overall — {filename}"
+
+        # Hard-truncate every line to prevent soft-wraps from corrupting the row count
+        lines = [
+            line1[:term_width - 1],
+            line2[:term_width - 1],
+            line3[:term_width - 1]
+        ]
+
+        if not self.has_drawn:
+            # First frame: print an empty separating line, then the 3 lines cleanly
+            sys.stdout.write(f"\n\r\033[K{lines[0]}\n")
+            sys.stdout.write(f"\r\033[K{lines[1]}\n")
+            sys.stdout.write(f"\r\033[K{lines[2]}")
+            self.has_drawn = True
+        else:
+            # Subsequent frames: jump up 2 lines, redraw, and leave cursor at line 3
+            sys.stdout.write("\033[2A")                 # Move up 2 lines
+            sys.stdout.write(f"\r\033[K{lines[0]}\n")   # Clear & overwrite Line 1
+            sys.stdout.write(f"\r\033[K{lines[1]}\n")   # Clear & overwrite Line 2
+            sys.stdout.write(f"\r\033[K{lines[2]}")     # Clear & overwrite Line 3
+
+        sys.stdout.flush()
+
+    def finish(self):
+        """Move cursor below the 3-line block once the disc finishes."""
+        print()
+
+    def get_cumulative_index(self):
+        """Pass the overall file counter to the next disc's tracker."""
+        return self.cumulative_file_index
 
 def find_top_level_folders(source_folder):
+    """Find all top-level directories in the source root, ignoring symlinks."""
     folders = [
         path
         for path in source_folder.iterdir()
         if path.is_dir() and not path.is_symlink()
     ]
-
-    return sorted(
-        folders,
-        key=lambda path: path.name.casefold()
-    )
-
+    return sorted(folders, key=sort_key_case_insensitive)
 
 def find_files(top_level_folder):
+    """Recursively collect and sort all regular files inside a folder."""
     files = [
         path
         for path in top_level_folder.rglob("*")
         if path.is_file() and not path.is_symlink()
     ]
-
     return sorted(
         files,
-        key=lambda path: alphabetical_key(
-            path.relative_to(top_level_folder)
-        )
+        key=lambda path: sort_key_case_insensitive(path.relative_to(top_level_folder)),
     )
 
+def validate_files_fit_capacity(files, capacity):
+    """Ensure no individual file is too large to fit on a single disc."""
+    for file_path in files:
+        file_size = file_path.stat().st_size
+        if file_size > capacity:
+            raise ValueError(
+                "A single file is larger than the selected capacity:\n"
+                f" File: {file_path}\n"
+                f" Size: {file_size:,} bytes\n"
+                f" Capacity: {capacity:,} bytes"
+            )
 
 def create_disc_plan(top_level_folders, capacity):
-    """Create a plan for distributing files across discs."""
+    """Greedily assign files to numbered discs while trying to keep folders together."""
     assignments = []
-
     disc_number = 1
     used_space = 0
 
     for top_level_folder in top_level_folders:
         files = find_files(top_level_folder)
+        validate_files_fit_capacity(files, capacity)
+        folder_size = sum(file_path.stat().st_size for file_path in files)
 
-        folder_size = sum(
-            file_path.stat().st_size
-            for file_path in files
-        )
+        # Try to keep the entire folder intact on the next disc if it won't fit here
+        if used_space > 0 and used_space + folder_size > capacity:
+            disc_number += 1
+            used_space = 0
 
+        # If a folder exceeds disc capacity on its own, roll over individual files as needed
         for file_path in files:
             file_size = file_path.stat().st_size
-
-            if file_size > capacity:
-                raise ValueError(
-                    "A single file is larger than the selected capacity:\n"
-                    f"  File: {file_path}\n"
-                    f"  Size: {file_size:,} bytes\n"
-                    f"  Capacity: {capacity:,} bytes"
-                )
-
-        if used_space > 0:
-            if folder_size <= capacity:
-                if used_space + folder_size > capacity:
-                    disc_number += 1
-                    used_space = 0
-
-            else:
-                disc_number += 1
-                used_space = 0
-
-        for file_path in files:
-            file_size = file_path.stat().st_size
-
-            if (
-                used_space > 0
-                and used_space + file_size > capacity
-            ):
+            if used_space > 0 and used_space + file_size > capacity:
                 disc_number += 1
                 used_space = 0
 
@@ -150,55 +180,42 @@ def create_disc_plan(top_level_folders, capacity):
                     "size": file_size,
                 }
             )
-
             used_space += file_size
 
     return assignments
 
-
 def calculate_folder_parts(assignments):
-    """Determine how many parts each folder is split across."""
-    discs_by_folder = defaultdict(list)
-
+    """Calculate multi-disc span counts for folders (e.g., 'Part 1 of 3')."""
+    discs_by_folder = defaultdict(set)
     for item in assignments:
         folder_name = item["top_level_name"]
         disc = item["disc"]
-
-        if disc not in discs_by_folder[folder_name]:
-            discs_by_folder[folder_name].append(disc)
-
-    for discs in discs_by_folder.values():
-        discs.sort()
+        discs_by_folder[folder_name].add(disc)
 
     result = {}
-
     for folder_name, discs in discs_by_folder.items():
-        total_parts = len(discs)
-
-        for part_number, disc in enumerate(discs, start=1):
-            result[(folder_name, disc)] = (
-                part_number,
-                total_parts
-            )
+        sorted_discs = sorted(discs)
+        total_parts = len(sorted_discs)
+        for part_number, disc in enumerate(sorted_discs, start=1):
+            result[(folder_name, disc)] = (part_number, total_parts)
 
     return result
 
-
 def get_output_folder_name(folder_name, disc, folder_parts):
-    """Get the output folder name, accounting for multi-part folders."""
+    """Format folder name, appending split suffixes only if it spans multiple discs."""
     part_number, total_parts = folder_parts[(folder_name, disc)]
-
     if total_parts == 1:
         return folder_name
-
     return f"{folder_name} ({part_number} out of {total_parts})"
 
+def get_disc_folder_path(output_folder, disc_number):
+    """Generate the standardized target folder name for a given disc index."""
+    return output_folder / f"Disc {disc_number:02d}"
 
 def print_disc_plan(assignments, capacity):
-    """Display the planned disc distribution."""
+    """Print an overview of total discs required and storage distribution."""
     disc_sizes = defaultdict(int)
     disc_file_counts = defaultdict(int)
-
     for item in assignments:
         disc = item["disc"]
         disc_sizes[disc] += item["size"]
@@ -210,12 +227,10 @@ def print_disc_plan(assignments, capacity):
 
     print("\nDisc plan")
     print("---------")
-
     for disc in sorted(disc_sizes):
         size = disc_sizes[disc]
         file_count = disc_file_counts[disc]
         percentage = size / capacity * 100
-
         print(
             f"Disc {disc:02d}: "
             f"{size:,} bytes, "
@@ -226,345 +241,200 @@ def print_disc_plan(assignments, capacity):
     print(f"\nTotal discs: {max(disc_sizes)}")
     print(f"Planning capacity: {capacity:,} bytes")
 
-
 def print_output_structure(assignments):
-    """Display the resulting folder structure."""
+    """Display the planned folder layout showing which folders land on which disc."""
     folder_parts = calculate_folder_parts(assignments)
-    folders = set()
+    disc_folders = defaultdict(set)
 
     for item in assignments:
         folder_name = item["top_level_name"]
-        source_top_level_folder = item["top_level_folder"]
-        source_file = item["file"]
         disc = item["disc"]
+        output_name = get_output_folder_name(folder_name, disc, folder_parts)
+        disc_folders[disc].add(output_name)
 
-        output_top_level_name = get_output_folder_name(
-            folder_name,
-            disc,
-            folder_parts
-        )
+    if not disc_folders:
+        print("No output structure to display.")
+        return
 
-        disc_folder = Path(f"Disc {disc:02d}")
+    print("\nOutput structure")
+    print("----------------")
+    for disc in sorted(disc_folders.keys()):
+        print(f"Disc {disc:02d}/")
+        for folder_name in sorted(disc_folders[disc]):
+            print(f"  {folder_name}/")
+        print(f"  {INTEGRITY_FOLDER_NAME}/")
 
-        destination_file = (
-            disc_folder
-            / output_top_level_name
-            / source_file.relative_to(source_top_level_folder)
-        )
+def copy_files(assignments, output_folder, capacity):
+    """Copy assigned files into their corresponding Disc output folders."""
+    assignments_by_disc = defaultdict(list)
+    for item in assignments:
+        disc = item["disc"]
+        assignments_by_disc[disc].append(item)
 
-        folders.add(disc_folder)
-
-        for parent in destination_file.parents:
-            if str(parent) != ".":
-                folders.add(parent)
-
-    print("\nResulting folder structure")
-    print("--------------------------")
-
-    for folder in sorted(
-        folders,
-        key=lambda path: str(path).casefold()
-    ):
-        print(f"  {folder}\\")
-
-
-def copy_files(assignments, output_folder):
-    """Copy files to disc folders with clean progress display."""
     folder_parts = calculate_folder_parts(assignments)
     total_files = len(assignments)
-    current_disc = None
-    max_filename_width = 50  # Truncate long filenames to avoid line wrapping
 
     print("\nCopying files to discs...")
+    cumulative_file_index = 0
 
-    for index, item in enumerate(assignments, start=1):
-        folder_name = item["top_level_name"]
-        source_top_level_folder = item["top_level_folder"]
-        source_file = item["file"]
-        disc = item["disc"]
+    for disc in sorted(assignments_by_disc.keys()):
+        disc_assignments = assignments_by_disc[disc]
 
-        # Print disc header when switching to a new disc
-        if disc != current_disc:
-            if current_disc is not None:
-                print()  # Newline after previous disc progress
-            print(f"\nDisc {disc:02d}:")
-            current_disc = disc
-
-        output_top_level_name = get_output_folder_name(
-            folder_name,
-            disc,
-            folder_parts
+        progress = ProgressTracker(
+            disc_number=disc,
+            capacity=capacity,
+            total_files=total_files,
+            cumulative_start=cumulative_file_index,
         )
 
-        disc_folder = output_folder / f"Disc {disc:02d}"
-        output_top_level_folder = (
-            disc_folder / output_top_level_name
-        )
+        for item in disc_assignments:
+            folder_name = item["top_level_name"]
+            source_top_level_folder = item["top_level_folder"]
+            source_file = item["file"]
+            file_size = item["size"]
 
-        relative_path = source_file.relative_to(
-            source_top_level_folder
-        )
+            # Reconstruct original subfolder hierarchy inside the disc directory
+            output_top_level_name = get_output_folder_name(
+                folder_name, disc, folder_parts
+            )
+            disc_folder = get_disc_folder_path(output_folder, disc)
+            output_top_level_folder = disc_folder / output_top_level_name
+            relative_path = source_file.relative_to(source_top_level_folder)
+            destination_file = output_top_level_folder / relative_path
 
-        destination_file = output_top_level_folder / relative_path
-        destination_file.parent.mkdir(
-            parents=True,
-            exist_ok=True
-        )
+            destination_file.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_file, destination_file)
 
-        shutil.copy2(source_file, destination_file)
-
-        # Update progress on same line with proper clearing
-        percentage = index / total_files * 100
-        file_name = source_file.name
-
-        # Truncate filename if too long
-        if len(file_name) > max_filename_width:
-            file_name = file_name[:max_filename_width - 3] + "..."
-
-        # Use ANSI escape code to clear to end of line
-        progress_line = (
-            f"  [{index:5d}/{total_files}] {percentage:5.1f}% — {file_name}"
-        )
-        print(f"\r{progress_line}\033[K", end="", flush=True)
-
-    print()  # Final newline
-    print(f"\n✓ Finished copying {total_files} files to:\n  {output_folder}")
-
-
-def create_checksums_for_disc(disc_folder):
-    """Create checksums.sha and verification instructions for a disc."""
-    integrity_folder = disc_folder / INTEGRITY_FOLDER_NAME
-    instructions_file = integrity_folder / INSTRUCTIONS_FILENAME
-    checksum_file = integrity_folder / CHECKSUM_FILENAME
-
-    integrity_folder.mkdir(parents=True, exist_ok=True)
-
-    with instructions_file.open(
-        "w",
-        encoding="utf-8",
-        newline="\n"
-    ) as file:
-        file.write(INSTRUCTIONS_TEXT)
-
-    files = []
-
-    for file_path in disc_folder.rglob("*"):
-        if not file_path.is_file() or file_path.is_symlink():
-            continue
-
-        if file_path == checksum_file:
-            continue
-
-        relative_path = Path(
-            os.path.relpath(file_path, integrity_folder)
-        ).as_posix()
-
-        if "\n" in relative_path:
-            raise ValueError(
-                "Unsupported filename containing a newline:\n"
-                f"  {file_path}"
+            progress.update(
+                file_size=file_size,
+                folder_name=folder_name,
+                filename=source_file.name,
             )
 
-        files.append((file_path, relative_path))
+        progress.finish()
+        cumulative_file_index = progress.get_cumulative_index()
 
-    files.sort(key=lambda item: item[1].casefold())
+def create_checksums_for_disc(disc_number, disc_folder, capacity):
+    """Generate SHA-256 hashes for all files on a disc and save them to a verification file."""
+    integrity_folder = disc_folder / INTEGRITY_FOLDER_NAME
+    integrity_folder.mkdir(parents=True, exist_ok=True)
 
-    total_files = len(files)
+    # Exclude files inside the integrity folder so we don't hash the hash file itself
+    files_to_checksum = [
+        path
+        for path in disc_folder.rglob("*")
+        if path.is_file()
+        and not path.is_symlink()
+        and INTEGRITY_FOLDER_NAME not in path.parts
+    ]
+    files_to_checksum.sort(
+        key=lambda path: sort_key_case_insensitive(path.relative_to(disc_folder))
+    )
 
-    print(f"\n{disc_folder.name}:")
-    print(f"  Total files: {total_files}")
+    checksum_file = integrity_folder / CHECKSUM_FILENAME
 
-    with checksum_file.open(
-        "w",
-        encoding="utf-8",
-        newline="\n"
-    ) as output:
-        for index, (file_path, relative_path) in enumerate(files, start=1):
-            digest = sha256_file(file_path)
+    disc_bytes = sum(f.stat().st_size for f in files_to_checksum)
+    used_gb = bytes_to_gb(disc_bytes)
+    total_gb = bytes_to_gb(capacity)
+    print(f"\nDisc {disc_number:02d} ({used_gb:.1f} GB / {total_gb:.1f} GB)")
+    print("  Creating checksums...")
 
-            output.write(f"{digest}  {relative_path}\n")
+    with checksum_file.open("w") as f:
+        for idx, file_path in enumerate(files_to_checksum, start=1):
+            file_checksum = sha256_file(file_path)
+            relative_path = file_path.relative_to(disc_folder)
+            f.write(f"{file_checksum}  {relative_path}\n")
 
-            percentage = index / total_files * 100 if total_files else 100
-            file_name = file_path.name
-
-            # Truncate filename if too long
-            if len(file_name) > 50:
-                file_name = file_name[:47] + "..."
-
-            # Use ANSI escape code to clear to end of line
+            percentage = idx / len(files_to_checksum) * 100 if files_to_checksum else 100
             progress_line = (
-                f"  [{index:5d}/{total_files}] {percentage:5.1f}% — {file_name}"
+                f"    [{idx:5d}/{len(files_to_checksum)}]  "
+                f"{percentage:5.1f}% — {file_path.name}"
             )
             print(f"\r{progress_line}\033[K", end="", flush=True)
 
-    print()  # Final newline
-    print(f"  ✓ Created: {checksum_file.name}")
+    print()
 
+def create_verification_instructions_for_disc(disc_number, disc_folder):
+    """Write user instructions for verifying disc contents using the checksum file."""
+    integrity_folder = disc_folder / INTEGRITY_FOLDER_NAME
+    integrity_folder.mkdir(parents=True, exist_ok=True)
+    instructions_file = integrity_folder / INSTRUCTIONS_FILENAME
+    instructions_file.write_text(INSTRUCTIONS_TEXT)
 
-def find_disc_folders(output_folder):
-    """Find all Disc XX folders."""
-    disc_folders = []
-
-    for path in output_folder.iterdir():
-        if not path.is_dir() or path.is_symlink():
-            continue
-
-        if path.name.startswith("Disc "):
-            disc_folders.append(path)
-
-    return sorted(
-        disc_folders,
-        key=lambda path: path.name.casefold()
-    )
-
+def create_integrity_data(output_folder, disc_count, capacity):
+    """Generate checksums and verification README files across all created disc folders."""
+    for disc_number in range(1, disc_count + 1):
+        disc_folder = get_disc_folder_path(output_folder, disc_number)
+        if disc_folder.exists():
+            create_checksums_for_disc(disc_number, disc_folder, capacity)
+            create_verification_instructions_for_disc(disc_number, disc_folder)
 
 def main():
+    """Parse command line arguments and execute the disc preparation workflow."""
     parser = argparse.ArgumentParser(
-        description=(
-            "Organize files into disc-sized folders with checksums "
-            "and verification instructions."
-        )
+        description="Organize files into disc-sized folders with integrity verification."
     )
-
     parser.add_argument(
         "source_folder",
         type=Path,
-        help="Folder containing the top-level folders to organize"
+        help="Source folder containing top-level folders to organize.",
     )
-
     parser.add_argument(
         "output_folder",
         type=Path,
-        nargs="?",
-        help=(
-            "Folder where Disc 01, Disc 02, etc. will be created. "
-            "Not required when --plan-only is used."
-        )
+        help="Output folder where Disc XX folders will be created.",
     )
-
     parser.add_argument(
         "--capacity",
         type=int,
         default=DEFAULT_CAPACITY,
-        help=(
-            "Maximum size per disc in bytes. "
-            f"Default: {DEFAULT_CAPACITY:,}"
-        )
+        help=f"Maximum bytes per disc (default: {DEFAULT_CAPACITY:,}).",
     )
-
-    parser.add_argument(
-        "--plan-only",
-        action="store_true",
-        help=(
-            "Show the disc plan and resulting folder structure "
-            "without copying files or creating checksums."
-        )
-    )
-
     parser.add_argument(
         "--skip-checksums",
         action="store_true",
-        help="Copy files to discs but skip checksum generation."
+        help="Skip checksum creation; only copy files.",
     )
-
     args = parser.parse_args()
 
-    source_folder = args.source_folder.expanduser().resolve()
-
-    if args.output_folder is not None:
-        output_folder = args.output_folder.expanduser().resolve()
-    else:
-        output_folder = None
-
-    if not args.plan_only and output_folder is None:
-        parser.error(
-            "output_folder is required unless --plan-only is used"
-        )
-
-    if not source_folder.exists():
-        print(f"Source folder does not exist:\n{source_folder}")
+    if not args.source_folder.is_dir():
+        print(f"Error: Source folder not found: {args.source_folder}", file=sys.stderr)
         sys.exit(1)
 
-    if not source_folder.is_dir():
-        print(f"Source path is not a folder:\n{source_folder}")
-        sys.exit(1)
-
-    if args.capacity <= 0:
-        print("Capacity must be greater than zero.")
-        sys.exit(1)
-
-    if output_folder is not None:
-        try:
-            output_folder.relative_to(source_folder)
-
-            print(
-                "The output folder must not be inside the source folder."
-            )
-            sys.exit(1)
-
-        except ValueError:
-            pass
-
-    top_level_folders = find_top_level_folders(source_folder)
-
+    top_level_folders = find_top_level_folders(args.source_folder)
     if not top_level_folders:
-        print("No top-level folders were found.")
+        print("Error: No top-level folders found in source folder.", file=sys.stderr)
         sys.exit(1)
 
-    print("Top-level folders found:")
-
-    for folder in top_level_folders:
-        print(f"  {folder.name}")
-
-    try:
-        assignments = create_disc_plan(
-            top_level_folders,
-            args.capacity
-        )
-
-    except ValueError as error:
-        print(f"\n✗ Error: {error}")
+    assignments = create_disc_plan(top_level_folders, args.capacity)
+    if not assignments:
+        print("Error: No files found to organize.", file=sys.stderr)
         sys.exit(1)
 
+    disc_count = max(item["disc"] for item in assignments)
+
+    # Always show plan and target structure first
     print_disc_plan(assignments, args.capacity)
     print_output_structure(assignments)
 
-    if args.plan_only:
-        print("\n(Plan only — no files copied)")
-        return
-
-    if output_folder.exists():
-        print(f"\n⚠ Output folder already exists:\n  {output_folder}")
-        response = input("Continue anyway and overwrite? (yes/no): ").strip().lower()
-
-        if response != "yes":
-            print("Cancelled.")
-            sys.exit(0)
-
+    # Prompt user before writing anything to disk
     try:
-        output_folder.mkdir(parents=True, exist_ok=True)
-        copy_files(assignments, output_folder)
+        response = input("\nDo you want to proceed with copying files? [y/N]: ").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        print("\nAborted.")
+        sys.exit(0)
 
-    except Exception as error:
-        print(f"\n✗ Error copying files: {error}")
-        sys.exit(1)
+    if response not in ("y", "yes"):
+        print("Operation cancelled. No files were copied.")
+        sys.exit(0)
 
-    if args.skip_checksums:
-        print("\n(Skipping checksum generation)")
-        return
+    args.output_folder.mkdir(parents=True, exist_ok=True)
+    copy_files(assignments, args.output_folder, args.capacity)
 
-    print("\nGenerating checksums...")
+    if not args.skip_checksums:
+        create_integrity_data(args.output_folder, disc_count, args.capacity)
 
-    disc_folders = find_disc_folders(output_folder)
-
-    for disc_folder in disc_folders:
-        create_checksums_for_disc(disc_folder)
-
-    print(
-        "\n✓ All discs completed successfully!"
-        f"\n  Output folder: {output_folder}"
-    )
-
+    print("\nDone!")
 
 if __name__ == "__main__":
     main()
